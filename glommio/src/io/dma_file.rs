@@ -488,7 +488,7 @@ impl DmaFile {
     /// Copies a file range from one file to another in kernel space. This is going to have the same performance
     /// characteristic as splice except if both files are on the same filesystem and the filesystem supports reflinks.
     /// In that case, the underlying disk blocks will be CoW linked instead of actually performing a copy.
-    /// Since `copy_file_range` is not yet implemented on io_uring (https://github.com/axboe/liburing/issues/831),
+    /// Since `copy_file_range` is not yet implemented on io_uring <https://github.com/axboe/liburing/issues/831>,
     /// this is just a dispatch to the blocking thread pool to do the syscall.
     pub async fn copy_file_range_aligned(
         &self,
@@ -643,7 +643,7 @@ impl DmaFile {
     }
 
     /// The major ID of the device containing the filesystem where the file resides.
-    /// The device may be found by issuing a `readlink`` on `/sys/dev/block/<major>:<minor>`
+    /// The device may be found by issuing a `readlink` on `/sys/dev/block/<major>:<minor>`
     pub fn dev_major(&self) -> u32 {
         self.file.dev_major
     }
@@ -664,6 +664,17 @@ impl DmaFile {
             max_segment_size: self.max_segment_size,
             pollable: self.pollable,
         }
+    }
+
+    /// How many strong references are holding this file open. The returned count will always be at least 1.
+    ///
+    /// # Safety
+    ///
+    /// This method by itself is safe, but using it correctly requires extra care. Another thread can change the count
+    /// at any time, including potentially between calling this method and acting on the result. You probably want to
+    /// use [Self::downgrade] or [DmaFile::try_take_last_clone] to manage the ownership.
+    pub fn strong_count(&self) -> usize {
+        self.file.strong_count()
     }
 
     /// Convenience method that closes a DmaFile wrapped inside an Rc.
@@ -803,7 +814,7 @@ impl OwnedDmaFile {
     }
 
     /// The major ID of the device containing the filesystem where the file resides.
-    /// The device may be found by issuing a `readlink`` on `/sys/dev/block/<major>:<minor>`
+    /// The device may be found by issuing a `readlink` on `/sys/dev/block/<major>:<minor>`
     pub fn dev_major(&self) -> u32 {
         self.file.dev_major
     }
@@ -831,6 +842,17 @@ impl OwnedDmaFile {
             max_segment_size: self.max_segment_size,
             pollable: self.pollable,
         }
+    }
+
+    /// How many strong references are holding this file open. The returned count will always be at least 1.
+    ///
+    /// # Safety
+    ///
+    /// This method by itself is safe, but using it correctly requires extra care. Another thread can change the count
+    /// at any time, including potentially between calling this method and acting on the result. You probably want to
+    /// use [Self::downgrade] or convert to a [DmaFile] and use [DmaFile::try_take_last_clone].
+    pub fn strong_count(&self) -> usize {
+        self.file.strong_count()
     }
 }
 
@@ -880,7 +902,31 @@ pub struct WeakDmaFile {
     pollable: PollableStatus,
 }
 
+impl Default for WeakDmaFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WeakDmaFile {
+    /// Creates an empty reference that will never upgrade.
+    pub fn new() -> WeakDmaFile {
+        Self {
+            file: WeakGlommioFile::new(),
+            o_direct_alignment: 0,
+            max_sectors_size: 0,
+            max_segment_size: 0,
+            pollable: PollableStatus::Pollable,
+        }
+    }
+
+    /// The number of strong references that still remain on the file.
+    /// If created via [Self::new], this will return 0.
+    pub fn strong_count(&self) -> usize {
+        self.file.strong_count()
+    }
+
+    /// Returns an `Option` containing ownership over the file if the file hasn't been closed yet, otherwise None.
     pub fn upgrade(&self) -> Option<OwnedDmaFile> {
         self.file.upgrade().map(|file| OwnedDmaFile {
             file,
@@ -2130,5 +2176,36 @@ pub(crate) mod test {
                 });
             })
             .await;
+    });
+
+    #[test]
+    fn new_weak_file_strong_count() {
+        assert_eq!(WeakDmaFile::new().strong_count(), 0);
+    }
+
+    dma_file_test!(weak_file_strong_count, path, _k, {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .tmpfile(true)
+            .dma_open(&path)
+            .await
+            .unwrap();
+
+        let weak = file.downgrade();
+        assert_eq!(weak.strong_count(), 1);
+
+        let cloned = file.clone();
+
+        assert_eq!(weak.strong_count(), 2);
+
+        std::mem::drop(file);
+
+        assert_eq!(weak.strong_count(), 1);
+
+        std::mem::drop(cloned);
+
+        assert_eq!(weak.strong_count(), 0);
     });
 }
